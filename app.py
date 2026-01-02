@@ -15,15 +15,30 @@ DB_PATH = "app.db"
 def create_app():
     app = Flask(__name__)
 
-    # ---------- CORS ----------
-    FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "").strip()
-
+    # ---------- CORS (fix für localhost + später Netlify) ----------
+    # FRONTEND_ORIGIN:
+    #  - "*" erlaubt alle Origins (nur für Tests)
+    #  - "https://deinshop.netlify.app" erlaubt exakt diese Domain
+    #  - leer => erlaubt localhost:* als Dev-Fallback
     @app.after_request
     def add_cors(resp):
-        if FRONTEND_ORIGIN:
-            resp.headers["Access-Control-Allow-Origin"] = FRONTEND_ORIGIN
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        origin = request.headers.get("Origin")
+        allowed = os.getenv("FRONTEND_ORIGIN", "").strip()
+
+        if allowed == "*":
+            # für Credentials wäre "*" nicht erlaubt, aber wir nutzen keine Cookies,
+            # daher ok. Wir echoen Origin zurück, wenn vorhanden.
+            resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+        elif allowed:
+            resp.headers["Access-Control-Allow-Origin"] = allowed
+        else:
+            # Dev-Fallback: localhost erlauben
+            if origin and origin.startswith("http://localhost:"):
+                resp.headers["Access-Control-Allow-Origin"] = origin
+
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return resp
 
     @app.route("/health")
@@ -167,7 +182,6 @@ def create_app():
         if result.get("status") != "COMPLETED":
             return jsonify({"error": "not completed", "details": result}), 400
 
-        # reference_id zurückholen
         product_id = result.get("purchase_units", [{}])[0].get("reference_id")
         if not product_id:
             return jsonify({"error": "missing reference_id"}), 500
