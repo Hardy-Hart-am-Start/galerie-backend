@@ -1,7 +1,10 @@
 import os
 import time
+import json
 import secrets
 import sqlite3
+import requests
+
 from flask import Flask, jsonify, request, Response, g
 import boto3
 from botocore.config import Config
@@ -11,6 +14,21 @@ DB_PATH = "app.db"
 
 def create_app():
     app = Flask(__name__)
+
+    # ---------- CORS ----------
+    FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "").strip()
+
+    @app.after_request
+    def add_cors(resp):
+        if FRONTEND_ORIGIN:
+            resp.headers["Access-Control-Allow-Origin"] = FRONTEND_ORIGIN
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp
+
+    @app.route("/health")
+    def health():
+        return {"ok": True}
 
     # ---------- Database ----------
     def get_db():
@@ -35,6 +53,17 @@ def create_app():
             revoked INTEGER NOT NULL DEFAULT 0
         )
         """)
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id TEXT NOT NULL,
+            paypal_order_id TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            token TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """)
         db.commit()
         db.close()
 
@@ -47,54 +76,149 @@ def create_app():
         aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
         aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"),
         config=Config(signature_version="s3v4"),
-        region_name="auto"
+        region_name="auto",
     )
+    BUCKET_ORIGINALS = os.environ.get("R2_BUCKET_ORIGINALS", "galerie-originals")
 
-    BUCKET = os.environ.get("R2_BUCKET_ORIGINALS")
+    # ---------- PayPal Config ----------
+    PAYPAL_MODE = os.getenv("PAYPAL_MODE", "live").strip()
+    PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "").strip()
+    PAYPAL_SECRET = os.getenv("PAYPAL_SECRET", "").strip()
 
-    # ---------- Routes ----------
-    @app.route("/health")
-    def health():
-        return {"ok": True}
+    PAYPAL_BASE = "https://api-m.paypal.com" if PAYPAL_MODE == "live" else "https://api-m.sandbox.paypal.com"
 
-    @app.route("/api/dev/grant", methods=["POST"])
-    def grant():
+    def paypal_access_token() -> str:
+        if not PAYPAL_CLIENT_ID or not PAYPAL_SECRET:
+            raise RuntimeError("PayPal credentials missing")
+        r = requests.post(
+            f"{PAYPAL_BASE}/v1/oauth2/token",
+            auth=(PAYPAL_CLIENT_ID, PAYPAL_SECRET),
+            headers={"Accept": "application/json", "Accept-Language": "en_US"},
+            data={"grant_type": "client_credentials"},
+            timeout=20
+        )
+        r.raise_for_status()
+        return r.json()["access_token"]
+
+    # ---------- PayPal: Create Order ----------
+    @app.route("/api/paypal/create-order", methods=["POST", "OPTIONS"])
+    def paypal_create_order():
+        if request.method == "OPTIONS":
+            return ("", 204)
+
         data = request.get_json(force=True)
-        product_id = data.get("product_id")
-        if not product_id:
-            return {"error": "product_id missing"}, 400
+        product_id = (data.get("product_id") or "").strip()
+        amount = data.get("amount")
+        currency = (data.get("currency") or "EUR").strip()
 
-        token = secrets.token_urlsafe(24)
+        if not product_id or amount is None:
+            return jsonify({"error": "product_id and amount required"}), 400
+
+        token = paypal_access_token()
+
+        payload = {
+            "intent": "CAPTURE",
+            "purchase_units": [{
+                "reference_id": product_id,
+                "amount": {"currency_code": currency, "value": str(amount)}
+            }]
+        }
+
+        r = requests.post(
+            f"{PAYPAL_BASE}/v2/checkout/orders",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            data=json.dumps(payload),
+            timeout=25
+        )
+        r.raise_for_status()
+        order = r.json()
+        paypal_order_id = order["id"]
+
+        now = int(time.time())
         db = get_db()
         db.execute(
-            "INSERT INTO tokens (token, product_id, created_at) VALUES (?, ?, ?)",
-            (token, product_id, int(time.time()))
+            "INSERT OR IGNORE INTO orders(product_id, paypal_order_id, status, token, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (product_id, paypal_order_id, "CREATED", None, now, now)
         )
         db.commit()
-        return {"token": token}
 
-    @app.route("/api/download")
+        return jsonify({"orderID": paypal_order_id})
+
+    # ---------- PayPal: Capture Order ----------
+    @app.route("/api/paypal/capture-order", methods=["POST", "OPTIONS"])
+    def paypal_capture_order():
+        if request.method == "OPTIONS":
+            return ("", 204)
+
+        data = request.get_json(force=True)
+        paypal_order_id = (data.get("orderID") or "").strip()
+        if not paypal_order_id:
+            return jsonify({"error": "orderID required"}), 400
+
+        token = paypal_access_token()
+        r = requests.post(
+            f"{PAYPAL_BASE}/v2/checkout/orders/{paypal_order_id}/capture",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            timeout=25
+        )
+        r.raise_for_status()
+        result = r.json()
+
+        if result.get("status") != "COMPLETED":
+            return jsonify({"error": "not completed", "details": result}), 400
+
+        # reference_id zurückholen
+        product_id = result.get("purchase_units", [{}])[0].get("reference_id")
+        if not product_id:
+            return jsonify({"error": "missing reference_id"}), 500
+
+        db = get_db()
+        row = db.execute("SELECT token FROM orders WHERE paypal_order_id = ?", (paypal_order_id,)).fetchone()
+        now = int(time.time())
+
+        # Idempotent: wenn Token schon existiert, gib den selben zurück
+        if row and row["token"]:
+            return jsonify({"status": "COMPLETED", "product_id": product_id, "token": row["token"]})
+
+        # Token erzeugen
+        access_token = secrets.token_urlsafe(24)
+        db.execute(
+            "INSERT INTO tokens(token, product_id, created_at, revoked) VALUES (?, ?, ?, 0)",
+            (access_token, product_id, now)
+        )
+        db.execute(
+            "UPDATE orders SET status=?, token=?, updated_at=? WHERE paypal_order_id=?",
+            ("COMPLETED", access_token, now, paypal_order_id)
+        )
+        db.commit()
+
+        return jsonify({"status": "COMPLETED", "product_id": product_id, "token": access_token})
+
+    # ---------- Download ----------
+    @app.route("/api/download", methods=["GET", "OPTIONS"])
     def download():
-        token = request.args.get("token")
-        product_id = request.args.get("product_id")
-        key = request.args.get("key")
+        if request.method == "OPTIONS":
+            return ("", 204)
+
+        token = (request.args.get("token") or "").strip()
+        product_id = (request.args.get("product_id") or "").strip()
+        key = (request.args.get("key") or "").strip()
 
         if not token or not product_id or not key:
-            return {"error": "missing params"}, 400
+            return jsonify({"error": "missing params"}), 400
 
         db = get_db()
         row = db.execute(
             "SELECT * FROM tokens WHERE token=? AND product_id=? AND revoked=0",
             (token, product_id)
         ).fetchone()
-
         if not row:
-            return {"error": "invalid token"}, 403
+            return jsonify({"error": "invalid token"}), 403
 
         try:
-            obj = s3.get_object(Bucket=BUCKET, Key=key)
+            obj = s3.get_object(Bucket=BUCKET_ORIGINALS, Key=key)
         except ClientError:
-            return {"error": "file not found"}, 404
+            return jsonify({"error": "file not found"}), 404
 
         def stream():
             while True:
