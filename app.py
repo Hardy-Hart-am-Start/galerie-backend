@@ -15,24 +15,17 @@ DB_PATH = "app.db"
 def create_app():
     app = Flask(__name__)
 
-    # ---------- CORS (fix für localhost + später Netlify) ----------
-    # FRONTEND_ORIGIN:
-    #  - "*" erlaubt alle Origins (nur für Tests)
-    #  - "https://deinshop.netlify.app" erlaubt exakt diese Domain
-    #  - leer => erlaubt localhost:* als Dev-Fallback
+    # ---------- CORS ----------
     @app.after_request
     def add_cors(resp):
         origin = request.headers.get("Origin")
         allowed = os.getenv("FRONTEND_ORIGIN", "").strip()
 
         if allowed == "*":
-            # für Credentials wäre "*" nicht erlaubt, aber wir nutzen keine Cookies,
-            # daher ok. Wir echoen Origin zurück, wenn vorhanden.
             resp.headers["Access-Control-Allow-Origin"] = origin or "*"
         elif allowed:
             resp.headers["Access-Control-Allow-Origin"] = allowed
         else:
-            # Dev-Fallback: localhost erlauben
             if origin and origin.startswith("http://localhost:"):
                 resp.headers["Access-Control-Allow-Origin"] = origin
 
@@ -190,11 +183,9 @@ def create_app():
         row = db.execute("SELECT token FROM orders WHERE paypal_order_id = ?", (paypal_order_id,)).fetchone()
         now = int(time.time())
 
-        # Idempotent: wenn Token schon existiert, gib den selben zurück
         if row and row["token"]:
             return jsonify({"status": "COMPLETED", "product_id": product_id, "token": row["token"]})
 
-        # Token erzeugen
         access_token = secrets.token_urlsafe(24)
         db.execute(
             "INSERT INTO tokens(token, product_id, created_at, revoked) VALUES (?, ?, ?, 0)",
@@ -208,7 +199,7 @@ def create_app():
 
         return jsonify({"status": "COMPLETED", "product_id": product_id, "token": access_token})
 
-    # ---------- Download ----------
+    # ---------- Download / View ----------
     @app.route("/api/download", methods=["GET", "OPTIONS"])
     def download():
         if request.method == "OPTIONS":
@@ -217,6 +208,9 @@ def create_app():
         token = (request.args.get("token") or "").strip()
         product_id = (request.args.get("product_id") or "").strip()
         key = (request.args.get("key") or "").strip()
+
+        # neu: inline=1 -> Bild im Browser anzeigen
+        inline = (request.args.get("inline") or "").strip() == "1"
 
         if not token or not product_id or not key:
             return jsonify({"error": "missing params"}), 400
@@ -241,11 +235,13 @@ def create_app():
                     break
                 yield chunk
 
+        disposition = "inline" if inline else "attachment"
         return Response(
             stream(),
             headers={
-                "Content-Disposition": f'attachment; filename="{key}"',
-                "Content-Type": obj.get("ContentType", "application/octet-stream")
+                "Content-Disposition": f'{disposition}; filename="{key}"',
+                "Content-Type": obj.get("ContentType", "application/octet-stream"),
+                "Cache-Control": "no-store"
             }
         )
 
