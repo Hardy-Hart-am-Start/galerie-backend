@@ -102,6 +102,7 @@ def create_app():
     PAYPAL_BASE = "https://api-m.paypal.com" if PAYPAL_MODE == "live" else "https://api-m.sandbox.paypal.com"
 
     # ✅ Frontend Base URL (für PayPal return_url/cancel_url)
+    # (bleibt drin, auch wenn wir return/cancel jetzt nicht mehr setzen)
     FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip() or os.getenv("FRONTEND_ORIGIN", "").strip()
 
     def paypal_access_token() -> str:
@@ -128,22 +129,14 @@ def create_app():
         amount = data.get("amount")
         currency = (data.get("currency") or "EUR").strip()
 
-        # ✅ NEU: return/cancel optional vom Frontend akzeptieren (Mobile App-Switch Fix)
-        return_url_in = (data.get("return_url") or "").strip()
-        cancel_url_in = (data.get("cancel_url") or "").strip()
-
         if not product_id or amount is None:
             return jsonify({"error": "product_id and amount required"}), 400
 
         token = paypal_access_token()
 
-        # ✅ PayPal Return/CANCEL URLs:
-        # - Wenn Frontend return/cancel mitsendet: nutzen (damit PayPal nach App-Switch in unseren Tab zurückkehrt)
-        # - Fallback: zurück auf pay.html (nicht success.html), weil pay.html danach selbst auf product.html weiterleitet
-        frontend = FRONTEND_BASE_URL or "https://glowing-raindrop-01abef.netlify.app"
-        return_url = return_url_in or f"{frontend}/pay.html?id={product_id}"
-        cancel_url = cancel_url_in or f"{frontend}/pay.html?id={product_id}"
-
+        # ✅ KORREKTUR:
+        # Für PayPal JS-SDK Buttons (Safari In-Context Checkout) lassen wir
+        # return_url / cancel_url weg, damit PayPal nicht unnötig in Redirect/App-Switch geht.
         payload = {
             "intent": "CAPTURE",
             "purchase_units": [{
@@ -151,8 +144,6 @@ def create_app():
                 "amount": {"currency_code": currency, "value": str(amount)}
             }],
             "application_context": {
-                "return_url": return_url,
-                "cancel_url": cancel_url,
                 "user_action": "PAY_NOW"
             }
         }
