@@ -5,7 +5,7 @@ import secrets
 import sqlite3
 import requests
 
-from flask import Flask, jsonify, request, Response, g
+from flask import Flask, jsonify, request, Response, g, redirect
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -86,7 +86,14 @@ def create_app():
         config=Config(signature_version="s3v4"),
         region_name="auto",
     )
-    BUCKET_ORIGINALS = os.environ.get("R2_BUCKET_ORIGINALS", "galerie-originals")
+
+    # ✅ FIX: wir nutzen jetzt deinen neuen ENV Namen (R2_BUCKET_PRIVATE)
+    # Fallback bleibt kompatibel, falls irgendwo noch R2_BUCKET_ORIGINALS gesetzt ist
+    BUCKET_ORIGINALS = (
+        os.environ.get("R2_BUCKET_PRIVATE")
+        or os.environ.get("R2_BUCKET_ORIGINALS")
+        or "galerie-originals"
+    )
 
     # ---------- PayPal Config ----------
     PAYPAL_MODE = os.getenv("PAYPAL_MODE", "live").strip()
@@ -199,7 +206,31 @@ def create_app():
 
         return jsonify({"status": "COMPLETED", "product_id": product_id, "token": access_token})
 
-    # ---------- Download / View ----------
+    # ---------- NEW: Signed URL shortcut (für schnellen Test / einfache Downloads) ----------
+    # Aufruf: /download_original?id=buy_001&key=buy_001_original.jpg
+    # Wenn "key" fehlt, nutzen wir product_id als Key (buy_001_original.jpg etc.) nicht automatisch,
+    # weil dein Shop keys pro Produkt in products.js pflegt. Für den Test gibst du key mit.
+    @app.route("/download_original", methods=["GET"])
+    def download_original_signed():
+        product_id = (request.args.get("id") or "").strip()
+        key = (request.args.get("key") or "").strip()
+
+        if not product_id or not key:
+            return jsonify({"error": "missing id or key"}), 400
+
+        # später kann hier Kaufprüfung rein; fürs Debug/Test erstmal offen
+        try:
+            url = s3.generate_presigned_url(
+                ClientMethod="get_object",
+                Params={"Bucket": BUCKET_ORIGINALS, "Key": key},
+                ExpiresIn=60
+            )
+        except Exception as e:
+            return jsonify({"error": "signed_url_failed", "details": str(e)}), 500
+
+        return redirect(url, code=302)
+
+    # ---------- Download / View (gekauft, token-basiert) ----------
     @app.route("/api/download", methods=["GET", "OPTIONS"])
     def download():
         if request.method == "OPTIONS":
