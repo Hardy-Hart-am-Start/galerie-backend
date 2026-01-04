@@ -2,3 +2,5 @@ flask
 gunicorn
 boto3
 requests
+boto3==1.34.0
+botocore==1.34.0
