@@ -128,15 +128,21 @@ def create_app():
         amount = data.get("amount")
         currency = (data.get("currency") or "EUR").strip()
 
+        # ✅ NEU: return/cancel optional vom Frontend akzeptieren (Mobile App-Switch Fix)
+        return_url_in = (data.get("return_url") or "").strip()
+        cancel_url_in = (data.get("cancel_url") or "").strip()
+
         if not product_id or amount is None:
             return jsonify({"error": "product_id and amount required"}), 400
 
         token = paypal_access_token()
 
-        # ✅ PayPal Return/CANCEL URLs: damit Mobile nach Zahlung in unserem Tab landet
+        # ✅ PayPal Return/CANCEL URLs:
+        # - Wenn Frontend return/cancel mitsendet: nutzen (damit PayPal nach App-Switch in unseren Tab zurückkehrt)
+        # - Fallback: zurück auf pay.html (nicht success.html), weil pay.html danach selbst auf product.html weiterleitet
         frontend = FRONTEND_BASE_URL or "https://glowing-raindrop-01abef.netlify.app"
-        return_url = f"{frontend}/success.html"
-        cancel_url = f"{frontend}/pay.html?id={product_id}"
+        return_url = return_url_in or f"{frontend}/pay.html?id={product_id}"
+        cancel_url = cancel_url_in or f"{frontend}/pay.html?id={product_id}"
 
         payload = {
             "intent": "CAPTURE",
