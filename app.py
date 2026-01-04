@@ -5,7 +5,7 @@ import secrets
 import sqlite3
 import requests
 
-from flask import Flask, jsonify, request, Response, g, redirect
+from flask import Flask, jsonify, request, Response, g
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -87,8 +87,7 @@ def create_app():
         region_name="auto",
     )
 
-    # ✅ FIX: wir nutzen jetzt deinen neuen ENV Namen (R2_BUCKET_PRIVATE)
-    # Fallback bleibt kompatibel, falls irgendwo noch R2_BUCKET_ORIGINALS gesetzt ist
+    # ✅ Bucket-Fix: akzeptiert R2_BUCKET_PRIVATE (neu) oder R2_BUCKET_ORIGINALS (alt)
     BUCKET_ORIGINALS = (
         os.environ.get("R2_BUCKET_PRIVATE")
         or os.environ.get("R2_BUCKET_ORIGINALS")
@@ -101,6 +100,9 @@ def create_app():
     PAYPAL_SECRET = os.getenv("PAYPAL_SECRET", "").strip()
 
     PAYPAL_BASE = "https://api-m.paypal.com" if PAYPAL_MODE == "live" else "https://api-m.sandbox.paypal.com"
+
+    # ✅ Frontend Base URL (für PayPal return_url/cancel_url)
+    FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip() or os.getenv("FRONTEND_ORIGIN", "").strip()
 
     def paypal_access_token() -> str:
         if not PAYPAL_CLIENT_ID or not PAYPAL_SECRET:
@@ -131,12 +133,22 @@ def create_app():
 
         token = paypal_access_token()
 
+        # ✅ PayPal Return/CANCEL URLs: damit Mobile nach Zahlung in unserem Tab landet
+        frontend = FRONTEND_BASE_URL or "https://glowing-raindrop-01abef.netlify.app"
+        return_url = f"{frontend}/success.html"
+        cancel_url = f"{frontend}/pay.html?id={product_id}"
+
         payload = {
             "intent": "CAPTURE",
             "purchase_units": [{
                 "reference_id": product_id,
                 "amount": {"currency_code": currency, "value": str(amount)}
-            }]
+            }],
+            "application_context": {
+                "return_url": return_url,
+                "cancel_url": cancel_url,
+                "user_action": "PAY_NOW"
+            }
         }
 
         r = requests.post(
@@ -206,31 +218,7 @@ def create_app():
 
         return jsonify({"status": "COMPLETED", "product_id": product_id, "token": access_token})
 
-    # ---------- NEW: Signed URL shortcut (für schnellen Test / einfache Downloads) ----------
-    # Aufruf: /download_original?id=buy_001&key=buy_001_original.jpg
-    # Wenn "key" fehlt, nutzen wir product_id als Key (buy_001_original.jpg etc.) nicht automatisch,
-    # weil dein Shop keys pro Produkt in products.js pflegt. Für den Test gibst du key mit.
-    @app.route("/download_original", methods=["GET"])
-    def download_original_signed():
-        product_id = (request.args.get("id") or "").strip()
-        key = (request.args.get("key") or "").strip()
-
-        if not product_id or not key:
-            return jsonify({"error": "missing id or key"}), 400
-
-        # später kann hier Kaufprüfung rein; fürs Debug/Test erstmal offen
-        try:
-            url = s3.generate_presigned_url(
-                ClientMethod="get_object",
-                Params={"Bucket": BUCKET_ORIGINALS, "Key": key},
-                ExpiresIn=60
-            )
-        except Exception as e:
-            return jsonify({"error": "signed_url_failed", "details": str(e)}), 500
-
-        return redirect(url, code=302)
-
-    # ---------- Download / View (gekauft, token-basiert) ----------
+    # ---------- Download / View ----------
     @app.route("/api/download", methods=["GET", "OPTIONS"])
     def download():
         if request.method == "OPTIONS":
@@ -240,7 +228,6 @@ def create_app():
         product_id = (request.args.get("product_id") or "").strip()
         key = (request.args.get("key") or "").strip()
 
-        # neu: inline=1 -> Bild im Browser anzeigen
         inline = (request.args.get("inline") or "").strip() == "1"
 
         if not token or not product_id or not key:
