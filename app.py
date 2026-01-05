@@ -101,8 +101,7 @@ def create_app():
 
     PAYPAL_BASE = "https://api-m.paypal.com" if PAYPAL_MODE == "live" else "https://api-m.sandbox.paypal.com"
 
-    # ✅ Frontend Base URL (für PayPal return_url/cancel_url)
-    # (bleibt drin, auch wenn wir return/cancel jetzt nicht mehr setzen)
+    # (bleibt drin, auch wenn wir return/cancel nicht setzen)
     FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip() or os.getenv("FRONTEND_ORIGIN", "").strip()
 
     def paypal_access_token() -> str:
@@ -134,9 +133,7 @@ def create_app():
 
         token = paypal_access_token()
 
-        # ✅ KORREKTUR:
-        # Für PayPal JS-SDK Buttons (Safari In-Context Checkout) lassen wir
-        # return_url / cancel_url weg, damit PayPal nicht unnötig in Redirect/App-Switch geht.
+        # ✅ Ohne return_url/cancel_url: JS-SDK In-Context bleibt stabiler in Safari
         payload = {
             "intent": "CAPTURE",
             "purchase_units": [{
@@ -251,11 +248,25 @@ def create_app():
                 yield chunk
 
         disposition = "inline" if inline else "attachment"
+
+        # ✅ Safari-Fix: bei inline=1 muss Content-Type zuverlässig image/* sein
+        content_type = obj.get("ContentType") or "application/octet-stream"
+        if inline and (not content_type.startswith("image/")):
+            k = key.lower()
+            if k.endswith(".jpg") or k.endswith(".jpeg"):
+                content_type = "image/jpeg"
+            elif k.endswith(".png"):
+                content_type = "image/png"
+            elif k.endswith(".webp"):
+                content_type = "image/webp"
+            elif k.endswith(".gif"):
+                content_type = "image/gif"
+
         return Response(
             stream(),
             headers={
                 "Content-Disposition": f'{disposition}; filename="{key}"',
-                "Content-Type": obj.get("ContentType", "application/octet-stream"),
+                "Content-Type": content_type,
                 "Cache-Control": "no-store"
             }
         )
